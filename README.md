@@ -44,11 +44,26 @@ pnpm build
 - `GET/POST /v1/workspaces/:id/chapters`
 - `PATCH /v1/chapters/:id`
 - `POST /v1/chapters/:id/blocks`
-- `POST /v1/chapters/:id/publish`
+- `POST /v1/chapters/:id/publish`（发布节点写入章节版本仓库，内容无变化返回 409）
+- `GET /v1/chapters/:id/versions`（版本仓库，revision 倒序）
+- `GET /v1/chapters/:id/versions/:revision`（按差量链重放出的历史完整内容）
+- `POST /v1/chapters/:id/rollback`（回滚到指定 revision，必传乐观版本号，冲突返回 409）
 - `GET /v1/workspaces/:id/events`
 - `GET /v1/realtime?workspaceId=...`（WebSocket）
 
 健康检查为 `GET /health` 和 `GET /ready`。
+
+## 章节版本仓库
+
+每次发布都会在 `ChapterVersion` 中保存一个版本节点：节点包含发布时的章节快照，以及相对上一节点的差量（内容块 added/updated/removed、标题与简介变化），并通过 `stateHash` + `parentStateHash` 组成哈希链。回滚时按 revision 顺序重放差量链重建目标节点的完整状态（`GET .../versions/:revision` 同源逻辑），同时校验哈希链，链损坏会返回 404/错误而不是静默恢复。
+
+`POST /v1/chapters/:id/rollback` 请求体为 `{ revision, expectedChapterVersion }`（也接受别名 `expectedRevision`）：
+
+- `revision` 是要恢复到的发布节点；`expectedChapterVersion` 必填，取自章节当前的 `version`（乐观锁）。
+- 回滚在单个可串行化事务内执行：先 `SELECT ... FOR UPDATE` 锁定章节行串行化并发发布/回滚，再校验版本号，版本不一致返回 `409 CHAPTER_VERSION_CONFLICT`。
+- 恢复时把线上内容块与目标快照对齐（删除/更新/沿用历史 id 新增），章节标题、简介与 `version` 一并更新；恢复目标引用的片段若已删除则自动解除关联。
+- 恢复结果本身会作为新的 `ROLLBACK` 节点（带 `restoredFromRevision`）追加到版本链，之后仍可继续发布新版本。
+- `rolled_back` 协作事件与数据恢复在同一事务写入，因此 `GET /v1/workspaces/:id/events` 的 sequence 始终连续、无空洞，事件 payload 内含恢复快照与 added/updated/removed 明细，其他端可据此同步。
 
 ## 存储
 

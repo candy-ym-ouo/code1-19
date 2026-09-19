@@ -26,6 +26,11 @@ enum ChapterStatus {
   PUBLISHED
 }
 
+enum ChapterVersionKind {
+  PUBLISH
+  ROLLBACK
+}
+
 model User {
   id                String               @id @default(uuid())
   email             String               @unique
@@ -152,9 +157,35 @@ model Chapter {
   workspace   Workspace     @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
   createdBy   User          @relation(fields: [createdById], references: [id], onDelete: Restrict)
   blocks      ChapterBlock[]
+  versions    ChapterVersion[]
 
   @@index([workspaceId, updatedAt])
   @@index([createdById])
+}
+
+model ChapterVersion {
+  id                   String              @id @default(uuid())
+  chapterId            String
+  workspaceId          String
+  revision             Int
+  kind                 ChapterVersionKind  @default(PUBLISH)
+  // 该发布节点的章节快照
+  title                String
+  intro                String
+  // 相对上一版本的差量（added/updated/removed 内容块、标题/简介变化）
+  deltaJson            Json
+  // 重放至本版本后的状态哈希（sha256），并通过 parentStateHash 串成哈希链
+  stateHash            String
+  parentStateHash      String?
+  // ROLLBACK 版本记录其回滚目标
+  restoredFromRevision Int?
+  createdById          String
+  createdAt            DateTime            @default(now())
+  chapter              Chapter             @relation(fields: [chapterId], references: [id], onDelete: Cascade)
+
+  @@unique([chapterId, revision])
+  @@index([chapterId, revision])
+  @@index([workspaceId, createdAt])
 }
 
 model ChapterBlock {

@@ -19,10 +19,20 @@ import { z } from 'zod';
 import {
   chapterBlockCreateSchema,
   chapterCreateSchema,
+  chapterRollbackSchema,
   chapterUpdateSchema,
   clipSchema,
   clipUpdateSchema,
 } from '@history/contracts';
+import {
+  listChapterVersions,
+  loadSnapshotAt,
+  savePublishSnapshot,
+  saveRollbackSnapshot,
+  toVersionSummary,
+  VersionConflictError,
+} from './versions/repository.js';
+import { applyBlockDelta, type VersionBlock } from './versions/engine.js';
 
 const MAX_UPLOAD_BYTES = 5 * 1024 * 1024 * 1024;
 const ALLOWED_AUDIO_EXTENSIONS = /\.(aac|aiff|flac|m4a|mp3|mp4|oga|ogg|opus|wav|webm)$/i;
@@ -824,60 +834,394 @@ app.post('/v1/chapters/:id/blocks', { preHandler: authenticate }, async (req, re
 
 app.post('/v1/chapters/:id/publish', { preHandler: authenticate }, async (req, reply) => {
   const chapterId = (req.params as { id: string }).id;
-  const chapter = await prisma.chapter.findUnique({
+  const existing = await prisma.chapter.findUnique({
     where: { id: chapterId },
-    include: {
-      blocks: {
-        include: {
-          clip: {
-            include: { recording: { select: { status: true } } },
-          },
-        },
-      },
-    },
+    select: { id: true, workspaceId: true },
   });
-  if (!chapter) throw new HttpError(404, 'NOT_FOUND', '章节不存在');
-  await requireMembership(req, chapter.workspaceId, [Role.OWNER, Role.EDITOR]);
-
-  if (chapter.blocks.length === 0) {
-    throw new HttpError(
-      400,
-      'PUBLISH_VALIDATION_FAILED',
-      '章节至少需要一个内容块',
-    );
-  }
-  const invalidBlock = chapter.blocks.find(
-    (block) =>
-      block.clip &&
-      (block.clip.deletedAt !== null || block.clip.recording.status !== 'READY'),
-  );
-  if (invalidBlock) {
-    throw new HttpError(
-      400,
-      'PUBLISH_VALIDATION_FAILED',
-      '章节包含不可播放或已归档的片段',
-    );
-  }
+  if (!existing) throw new HttpError(404, 'NOT_FOUND', '章节不存在');
+  await requireMembership(req, existing.workspaceId, [Role.OWNER, Role.EDITOR]);
 
   const user = authUser(req);
-  const published = await prisma.$transaction(async (tx) => {
-    const updated = await tx.chapter.update({
-      where: { id: chapter.id },
-      data: { status: 'PUBLISHED', version: { increment: 1 } },
-    });
-    await recordEvent(
-      tx,
-      chapter.workspaceId,
-      user.id,
-      'chapter',
-      updated.id,
-      'published',
-      updated,
+  try {
+    const published = await prisma.$transaction(
+      async (tx) => {
+        // 锁定章节行，串行化并发发布/回滚，避免 revision 竞争
+        const [locked] = await tx.$queryRaw<Array<{ id: string }>>(
+          Prisma.sql`SELECT id FROM "Chapter" WHERE id = ${chapterId} FOR UPDATE`,
+        );
+        if (!locked) throw new HttpError(404, 'NOT_FOUND', '章节不存在');
+
+        // 锁后重读章节与内容块，避免事务外快照与锁后状态不一致
+        const chapter = await tx.chapter.findUniqueOrThrow({
+          where: { id: chapterId },
+          include: {
+            blocks: {
+              include: {
+                clip: {
+                  include: { recording: { select: { status: true } } },
+                },
+              },
+            },
+          },
+        });
+
+        if (chapter.blocks.length === 0) {
+          throw new HttpError(
+            400,
+            'PUBLISH_VALIDATION_FAILED',
+            '章节至少需要一个内容块',
+          );
+        }
+        const invalidBlock = chapter.blocks.find(
+          (block) =>
+            block.clip &&
+            (block.clip.deletedAt !== null || block.clip.recording.status !== 'READY'),
+        );
+        if (invalidBlock) {
+          throw new HttpError(
+            400,
+            'PUBLISH_VALIDATION_FAILED',
+            '章节包含不可播放或已归档的片段',
+          );
+        }
+
+        const version = await savePublishSnapshot({
+          db: tx,
+          chapter: {
+            id: chapter.id,
+            workspaceId: chapter.workspaceId,
+            title: chapter.title,
+            intro: chapter.intro,
+          },
+          blocks: chapter.blocks.map((block) => ({
+            id: block.id,
+            type: block.type,
+            position: block.position,
+            contentJson: block.contentJson,
+            clipId: block.clipId,
+          })),
+          createdById: user.id,
+        });
+
+        const updated = await tx.chapter.update({
+          where: { id: chapter.id },
+          data: { status: 'PUBLISHED', version: { increment: 1 } },
+        });
+        await recordEvent(
+          tx,
+          chapter.workspaceId,
+          user.id,
+          'chapter',
+          updated.id,
+          'published',
+          { chapter: updated, revision: version.revision, versionId: version.id },
+        );
+        return { updated, version };
+      },
+      { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
     );
-    return updated;
-  });
-  return { data: published };
+
+    return { data: { chapter: published.updated, version: published.version } };
+  } catch (error) {
+    if (error instanceof VersionConflictError) {
+      return mapVersionError(reply, error);
+    }
+    throw error;
+  }
 });
+
+function mapVersionError(reply: FastifyReply, error: VersionConflictError) {
+  if (error.code === 'VERSION_NOT_FOUND') {
+    return reply.code(404).send({
+      error: { code: 'VERSION_NOT_FOUND', message: error.message, details: error.details },
+    });
+  }
+  return reply.code(409).send({
+    error: { code: error.code, message: error.message, details: error.details },
+  });
+}
+
+app.get('/v1/chapters/:id/versions', { preHandler: authenticate }, async (req) => {
+  const chapterId = (req.params as { id: string }).id;
+  const chapter = await prisma.chapter.findUnique({
+    where: { id: chapterId },
+    select: { id: true, workspaceId: true },
+  });
+  if (!chapter) throw new HttpError(404, 'NOT_FOUND', '章节不存在');
+  await requireMembership(req, chapter.workspaceId);
+
+  const [versions, current] = await Promise.all([
+    listChapterVersions(prisma, chapterId),
+    prisma.chapterVersion.findFirst({
+      where: { chapterId },
+      orderBy: { revision: 'desc' },
+      select: { revision: true },
+    }),
+  ]);
+  return { data: { latestRevision: current?.revision ?? 0, versions } };
+});
+
+app.get(
+  '/v1/chapters/:id/versions/:revision',
+  { preHandler: authenticate },
+  async (req, reply) => {
+    const chapterId = (req.params as { id: string }).id;
+    const params = validationError(
+      z.object({ revision: z.coerce.number().int().positive() }).strict(),
+      { revision: (req.params as { revision?: string }).revision },
+    );
+    const chapter = await prisma.chapter.findUnique({
+      where: { id: chapterId },
+      select: { id: true, workspaceId: true },
+    });
+    if (!chapter) throw new HttpError(404, 'NOT_FOUND', '章节不存在');
+    await requireMembership(req, chapter.workspaceId);
+
+    try {
+      const { snapshot } = await loadSnapshotAt(prisma, chapterId, params.revision);
+      return {
+        data: {
+          chapterId,
+          revision: params.revision,
+          title: snapshot.title,
+          intro: snapshot.intro,
+          blocks: snapshot.blocks,
+        },
+      };
+    } catch (error) {
+      if (error instanceof VersionConflictError) {
+        return mapVersionError(reply, error);
+      }
+      throw error;
+    }
+  },
+);
+
+app.post(
+  '/v1/chapters/:id/rollback',
+  { preHandler: authenticate },
+  async (req, reply) => {
+    const chapterId = (req.params as { id: string }).id;
+    const existing = await prisma.chapter.findUnique({
+      where: { id: chapterId },
+      select: { id: true, workspaceId: true },
+    });
+    if (!existing) throw new HttpError(404, 'NOT_FOUND', '章节不存在');
+    await requireMembership(req, existing.workspaceId, [Role.OWNER, Role.EDITOR]);
+
+    const body = validationError(chapterRollbackSchema, req.body);
+    // 必填的乐观版本号（防止基于过期状态并发回滚）
+    const expectedChapterVersion =
+      body.expectedRevision ?? body.expectedChapterVersion ?? 0;
+    const user = authUser(req);
+
+    try {
+      const result = await prisma.$transaction(
+        async (tx) => {
+          // 锁定章节行：并发回滚/发布在此串行排队
+          const [locked] = await tx.$queryRaw<Array<{ version: number }>>(
+            Prisma.sql`SELECT version FROM "Chapter" WHERE id = ${chapterId} FOR UPDATE`,
+          );
+          if (!locked) throw new HttpError(404, 'NOT_FOUND', '章节不存在');
+
+          // 乐观版本校验：调用方必须基于最新章节版本发起回滚
+          if (locked.version !== expectedChapterVersion) {
+            throw new VersionConflictError(
+              'CHAPTER_VERSION_CONFLICT',
+              '章节已被其他成员修改，请刷新后重试',
+              { expected: expectedChapterVersion, current: locked.version },
+            );
+          }
+
+          // 锁后重读章节，差量基线使用实时标题/简介
+          const chapter = await tx.chapter.findUniqueOrThrow({
+            where: { id: chapterId },
+          });
+
+          // 1. 重放差量，重建目标发布节点的完整状态（含哈希链校验）
+          const { snapshot: restored } = await loadSnapshotAt(
+            tx,
+            chapterId,
+            body.revision,
+          );
+
+          // 2. 读取当前线上内容块，计算恢复差量
+          const liveBlocks = await tx.chapterBlock.findMany({
+            where: { chapterId },
+            orderBy: { position: 'asc' },
+          });
+          const currentBlocks: VersionBlock[] = liveBlocks.map((block) => ({
+            id: block.id,
+            type: block.type,
+            position: block.position,
+            contentJson: block.contentJson,
+            clipId: block.clipId,
+          }));
+
+          // 恢复目标里引用的片段若已被删除，解除关联（SetNull），避免悬空外键
+          const existingClipIds = new Set(
+            (
+              await tx.clip.findMany({
+                where: {
+                  workspaceId: chapter.workspaceId,
+                  id: { in: restored.blocks.map((block) => block.clipId).filter(Boolean) as string[] },
+                  deletedAt: null,
+                },
+                select: { id: true },
+              })
+            ).map((clip) => clip.id),
+          );
+          const detachedClipIds: string[] = [];
+          for (const block of restored.blocks) {
+            if (block.clipId && !existingClipIds.has(block.clipId)) {
+              detachedClipIds.push(block.clipId);
+              block.clipId = null;
+            }
+          }
+
+          // 3. 把线上状态对齐到恢复目标：先删后增（恢复出来的块沿用历史 id）
+          const restoredIds = new Set(restored.blocks.map((block) => block.id));
+          const toDelete = currentBlocks
+            .filter((block) => !restoredIds.has(block.id))
+            .map((block) => block.id);
+          const restoredById = new Map(restored.blocks.map((block) => [block.id, block]));
+          const toCreate: VersionBlock[] = [];
+          const toUpdate: Array<{ where: { id: string }; data: Record<string, unknown> }> = [];
+
+          for (const current of currentBlocks) {
+            const target = restoredById.get(current.id);
+            if (!target) continue;
+            const data: Record<string, unknown> = {};
+            if (current.type !== target.type) data.type = target.type;
+            if (current.position !== target.position) data.position = target.position;
+            if (current.clipId !== target.clipId) data.clipId = target.clipId;
+            if (JSON.stringify(current.contentJson) !== JSON.stringify(target.contentJson)) {
+              data.contentJson = target.contentJson as Prisma.InputJsonValue;
+            }
+            if (Object.keys(data).length > 0) {
+              toUpdate.push({ where: { id: current.id }, data });
+            }
+          }
+          for (const target of restored.blocks) {
+            if (!currentBlocks.some((block) => block.id === target.id)) toCreate.push(target);
+          }
+
+          if (toDelete.length > 0) {
+            await tx.chapterBlock.deleteMany({
+              where: { chapterId, id: { in: toDelete } },
+            });
+          }
+          for (const update of toUpdate) {
+            await tx.chapterBlock.update({ where: update.where, data: update.data });
+          }
+          for (const block of toCreate) {
+            await tx.chapterBlock.create({
+              data: {
+                id: block.id,
+                chapterId,
+                type: block.type,
+                position: block.position,
+                contentJson: block.contentJson as Prisma.InputJsonValue,
+                clipId: block.clipId,
+              },
+            });
+          }
+
+          // 4. 恢复章节标题/简介，章节乐观版本号 +1
+          const updated = await tx.chapter.update({
+            where: { id: chapterId },
+            data: {
+              title: restored.title,
+              intro: restored.intro,
+              status: 'PUBLISHED',
+              version: { increment: 1 },
+            },
+          });
+
+          // 5. 恢复结果保存为新的 ROLLBACK 版本节点（差量快照）。
+          //    差量基线是恢复前的线上实时状态（含发布后的草稿编辑）。
+          const version = await saveRollbackSnapshot({
+            db: tx,
+            chapter: { id: chapterId, workspaceId: chapter.workspaceId },
+            restored: {
+              title: restored.title,
+              intro: restored.intro,
+              blocks: restored.blocks,
+            },
+            current: {
+              title: chapter.title,
+              intro: chapter.intro,
+              blocks: currentBlocks,
+            },
+            restoredFromRevision: body.revision,
+            createdById: user.id,
+          });
+
+          // 6. 同一事务写入协作事件：sequence 连续、无空洞
+          const event = await recordEvent(
+            tx,
+            chapter.workspaceId,
+            user.id,
+            'chapter',
+            chapterId,
+            'rolled_back',
+            {
+              chapter: updated,
+              revision: version.revision,
+              versionId: version.id,
+              restoredFromRevision: body.revision,
+              snapshot: {
+                title: restored.title,
+                intro: restored.intro,
+                blocks: restored.blocks,
+              },
+              detachedClipIds,
+              changes: {
+                added: applyBlockDelta([], {
+                  added: toCreate,
+                  updated: [],
+                  removed: [],
+                }),
+                updated: toUpdate.map((item) => ({
+                  id: item.where.id,
+                  fields: Object.keys(item.data),
+                })),
+                removed: toDelete,
+              },
+            },
+          );
+
+          return {
+            chapter: updated,
+            version: toVersionSummary(version),
+            event: { id: event.id, sequence: event.sequence },
+          };
+        },
+        { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+      );
+      return { data: result };
+    } catch (error) {
+      if (error instanceof VersionConflictError) {
+        return mapVersionError(reply, error);
+      }
+      // 可串行化冲突 / 唯一约束竞争：交给全局处理器转 409
+      if (
+        typeof error === 'object' &&
+        error !== null &&
+        'code' in error &&
+        ['P2034', 'P2002', '40001'].includes((error as { code?: string }).code ?? '')
+      ) {
+        return reply.code(409).send({
+          error: {
+            code: 'VERSION_REVISION_CONFLICT',
+            message: '并发版本操作冲突，请刷新后重试',
+          },
+        });
+      }
+      throw error;
+    }
+  },
+);
 
 app.get('/v1/workspaces/:id/events', { preHandler: authenticate }, async (req) => {
   const workspaceId = (req.params as { id: string }).id;

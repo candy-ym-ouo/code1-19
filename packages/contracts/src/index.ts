@@ -59,12 +59,42 @@ export const chapterBlockCreateSchema = z
   })
   .strict();
 
+export const chapterVersionKindSchema = z.enum(['PUBLISH', 'ROLLBACK']);
+
+export const chapterRollbackSchema = z
+  .object({
+    revision: z.number().int().positive(),
+    expectedRevision: z.number().int().positive().optional(),
+    expectedChapterVersion: z.number().int().positive().optional(),
+  })
+  .strict()
+  .refine(
+    (value) =>
+      value.expectedRevision !== undefined ||
+      value.expectedChapterVersion !== undefined,
+    {
+      message: 'expectedChapterVersion is required for optimistic concurrency control',
+      path: ['expectedChapterVersion'],
+    },
+  )
+  .refine(
+    (value) =>
+      value.expectedRevision === undefined ||
+      value.expectedChapterVersion === undefined,
+    {
+      message: 'expectedRevision and expectedChapterVersion are aliases, use one',
+      path: ['expectedChapterVersion'],
+    },
+  );
+
 export type Role = z.infer<typeof roleSchema>;
 export type ClipInput = z.infer<typeof clipSchema>;
 export type ClipUpdateInput = z.infer<typeof clipUpdateSchema>;
 export type ChapterCreateInput = z.infer<typeof chapterCreateSchema>;
 export type ChapterUpdateInput = z.infer<typeof chapterUpdateSchema>;
 export type ChapterBlockCreateInput = z.infer<typeof chapterBlockCreateSchema>;
+export type ChapterVersionKind = z.infer<typeof chapterVersionKindSchema>;
+export type ChapterRollbackInput = z.infer<typeof chapterRollbackSchema>;
 
 export const apiError = (code: string, message: string, details?: unknown) => ({
   error: { code, message, details },
