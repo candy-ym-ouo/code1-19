@@ -26,6 +26,11 @@ enum ChapterStatus {
   PUBLISHED
 }
 
+enum ChapterReleaseKind {
+  PUBLISH
+  ROLLBACK
+}
+
 model User {
   id                String               @id @default(uuid())
   email             String               @unique
@@ -152,6 +157,7 @@ model Chapter {
   workspace   Workspace     @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
   createdBy   User          @relation(fields: [createdById], references: [id], onDelete: Restrict)
   blocks      ChapterBlock[]
+  releases    ChapterRelease[]
 
   @@index([workspaceId, updatedAt])
   @@index([createdById])
@@ -169,6 +175,30 @@ model ChapterBlock {
 
   @@index([chapterId, position])
   @@index([clipId])
+}
+
+/// 章节版本仓库：按发布节点保存全量/差量快照。append-only，回滚追加 ROLLBACK 节点。
+model ChapterRelease {
+  id             String               @id @default(uuid())
+  chapterId      String
+  /// 章节内单调递增的发布序号
+  releaseNo      Int
+  kind           ChapterReleaseKind
+  /// ROLLBACK 节点指向恢复目标的发布号
+  rolledBackToNo Int?
+  /// full | delta
+  snapshotKind   String
+  /// delta 时指向差量基准发布号
+  baseReleaseNo  Int?
+  /// full: 完整快照；delta: 编辑脚本 + 头部差量
+  snapshotJson   Json
+  actorId        String
+  note           String?
+  createdAt      DateTime             @default(now())
+  chapter        Chapter              @relation(fields: [chapterId], references: [id], onDelete: Cascade)
+
+  @@unique([chapterId, releaseNo])
+  @@index([chapterId, createdAt])
 }
 
 model CollaborationEvent {

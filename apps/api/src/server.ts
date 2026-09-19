@@ -19,10 +19,19 @@ import { z } from 'zod';
 import {
   chapterBlockCreateSchema,
   chapterCreateSchema,
+  chapterPublishSchema,
+  chapterRollbackSchema,
   chapterUpdateSchema,
   clipSchema,
   clipUpdateSchema,
 } from '@history/contracts';
+import { createChapterVersionContext } from './release-repository.prisma.js';
+import {
+  resolveRelease,
+  VersionStoreError,
+  type Tx,
+} from './release-service.js';
+import type { ChapterSnapshot } from './version-store.js';
 
 const MAX_UPLOAD_BYTES = 5 * 1024 * 1024 * 1024;
 const ALLOWED_AUDIO_EXTENSIONS = /\.(aac|aiff|flac|m4a|mp3|mp4|oga|ogg|opus|wav|webm)$/i;
@@ -91,6 +100,8 @@ const redis = new Redis(process.env.REDIS_URL || 'redis://localhost:6379', {
 redis.on('error', (error) => app.log.warn({ err: error }, 'Redis connection error'));
 
 const mediaQueue = new Queue('media', { connection: redis });
+
+const chapterVersions = createChapterVersionContext(prisma);
 
 await app.register(cors, {
   origin: webOrigins,
@@ -824,6 +835,7 @@ app.post('/v1/chapters/:id/blocks', { preHandler: authenticate }, async (req, re
 
 app.post('/v1/chapters/:id/publish', { preHandler: authenticate }, async (req, reply) => {
   const chapterId = (req.params as { id: string }).id;
+  const body = validationError(chapterPublishSchema, req.body ?? {});
   const chapter = await prisma.chapter.findUnique({
     where: { id: chapterId },
     include: {
@@ -833,6 +845,7 @@ app.post('/v1/chapters/:id/publish', { preHandler: authenticate }, async (req, r
             include: { recording: { select: { status: true } } },
           },
         },
+        orderBy: { position: 'asc' },
       },
     },
   });
@@ -860,24 +873,174 @@ app.post('/v1/chapters/:id/publish', { preHandler: authenticate }, async (req, r
   }
 
   const user = authUser(req);
-  const published = await prisma.$transaction(async (tx) => {
-    const updated = await tx.chapter.update({
-      where: { id: chapter.id },
-      data: { status: 'PUBLISHED', version: { increment: 1 } },
+  try {
+    // 事务内锁章节行 + CAS：发布节点落全量/差量快照并写连续事件
+    const result = await chapterVersions.service.publish({
+      chapterId: chapter.id,
+      actorId: user.id,
+      expectedVersion: body.version,
     });
-    await recordEvent(
-      tx,
-      chapter.workspaceId,
-      user.id,
-      'chapter',
-      updated.id,
-      'published',
-      updated,
-    );
-    return updated;
-  });
-  return { data: published };
+    return {
+      data: {
+        chapter: result.chapter,
+        release: releaseSummary(result.release),
+      },
+    };
+  } catch (error) {
+    throw mapVersionStoreError(error);
+  }
 });
+
+/**
+ * 回滚到指定发布节点：
+ * - body.version 为必填乐观锁，并发回滚只有一个能提交，其余 409；
+ * - 回滚是“恢复 + 追加新发布节点”，历史快照与协作事件均不删除，
+ *   因此 GET /v1/workspaces/:id/events 的 sequence 始终连续。
+ */
+app.post('/v1/chapters/:id/rollback', { preHandler: authenticate }, async (req) => {
+  const chapterId = (req.params as { id: string }).id;
+  const body = validationError(chapterRollbackSchema, req.body);
+  const chapter = await prisma.chapter.findUnique({ where: { id: chapterId } });
+  if (!chapter) throw new HttpError(404, 'NOT_FOUND', '章节不存在');
+  await requireMembership(req, chapter.workspaceId, [Role.OWNER, Role.EDITOR]);
+
+  try {
+    const result = await chapterVersions.service.rollback({
+      chapterId: chapter.id,
+      actorId: authUser(req).id,
+      targetReleaseNo: body.releaseNo,
+      expectedVersion: body.version,
+    });
+    return {
+      data: {
+        chapter: result.chapter,
+        release: releaseSummary(result.release),
+        restored: {
+          blocks: result.plan.blocksToRestore.length,
+          deletedBlocks: result.plan.blockIdsToDelete.length,
+          missingClipIds: result.plan.missingClipIds,
+        },
+      },
+    };
+  } catch (error) {
+    throw mapVersionStoreError(error);
+  }
+});
+
+/** 发布节点列表（不含快照正文，用于时间线 UI） */
+app.get('/v1/chapters/:id/releases', { preHandler: authenticate }, async (req) => {
+  const chapterId = (req.params as { id: string }).id;
+  const chapter = await prisma.chapter.findUnique({ where: { id: chapterId } });
+  if (!chapter) throw new HttpError(404, 'NOT_FOUND', '章节不存在');
+  await requireMembership(req, chapter.workspaceId);
+
+  const releases = await prisma.chapterRelease.findMany({
+    where: { chapterId },
+    orderBy: { releaseNo: 'asc' },
+  });
+  return {
+    data: releases.map((release) => ({
+      id: release.id,
+      releaseNo: release.releaseNo,
+      kind: release.kind,
+      rolledBackToNo: release.rolledBackToNo,
+      snapshotKind: release.snapshotKind,
+      baseReleaseNo: release.baseReleaseNo,
+      actorId: release.actorId,
+      note: release.note,
+      createdAt: release.createdAt,
+    })),
+  };
+});
+
+/** 读取某个发布节点还原后的完整快照（沿差量链逐级还原） */
+app.get(
+  '/v1/chapters/:id/releases/:releaseNo',
+  { preHandler: authenticate },
+  async (req, reply) => {
+    const chapterId = (req.params as { id: string }).id;
+    const releaseNo = Number((req.params as { releaseNo: string }).releaseNo);
+    if (!Number.isSafeInteger(releaseNo) || releaseNo <= 0) {
+      throw new HttpError(400, 'INVALID_INPUT', '发布节点号无效');
+    }
+    const chapter = await prisma.chapter.findUnique({ where: { id: chapterId } });
+    if (!chapter) throw new HttpError(404, 'NOT_FOUND', '章节不存在');
+    await requireMembership(req, chapter.workspaceId);
+
+    const row = await prisma.chapterRelease.findUnique({
+      where: { chapterId_releaseNo: { chapterId, releaseNo } },
+    });
+    if (!row) {
+      return reply.code(404).send({
+        error: { code: 'RELEASE_NOT_FOUND', message: '发布节点不存在' },
+      });
+    }
+    const snapshot = await chapterVersions.context.run(async (tx) => {
+      const resolved = await resolveRelease(tx as Tx, chapterId, releaseNo);
+      return resolved?.snapshot as ChapterSnapshot;
+    });
+    return {
+      data: {
+        release: {
+          id: row.id,
+          releaseNo: row.releaseNo,
+          kind: row.kind,
+          rolledBackToNo: row.rolledBackToNo,
+          snapshotKind: row.snapshotKind,
+          baseReleaseNo: row.baseReleaseNo,
+          actorId: row.actorId,
+          note: row.note,
+          createdAt: row.createdAt,
+        },
+        snapshot,
+      },
+    };
+  },
+);
+
+function releaseSummary(release: {
+  id: string;
+  releaseNo: number;
+  kind: string;
+  rolledBackToNo: number | null;
+  snapshot: { kind: string; baseReleaseNo?: number };
+  actorId: string;
+  note: string | null;
+  createdAt: Date;
+}) {
+  return {
+    id: release.id,
+    releaseNo: release.releaseNo,
+    kind: release.kind,
+    rolledBackToNo: release.rolledBackToNo,
+    snapshotKind: release.snapshot.kind,
+    baseReleaseNo:
+      release.snapshot.kind === 'delta' ? release.snapshot.baseReleaseNo : null,
+    actorId: release.actorId,
+    note: release.note,
+    createdAt: release.createdAt,
+  };
+}
+
+function mapVersionStoreError(error: unknown): HttpError {
+  if (error instanceof VersionStoreError) {
+    switch (error.code) {
+      case 'VERSION_CONFLICT':
+        return new HttpError(409, 'CHAPTER_VERSION_CONFLICT', error.message);
+      case 'CHAPTER_NOT_FOUND':
+        return new HttpError(404, 'NOT_FOUND', '章节不存在');
+      case 'RELEASE_NOT_FOUND':
+        return new HttpError(404, 'RELEASE_NOT_FOUND', error.message);
+      case 'NO_PUBLISHED_RELEASE':
+        return new HttpError(409, 'NO_PUBLISHED_RELEASE', error.message);
+      case 'EMPTY_CHAPTER':
+        return new HttpError(400, 'PUBLISH_VALIDATION_FAILED', error.message);
+      default:
+        return new HttpError(400, error.code, error.message);
+    }
+  }
+  throw error;
+}
 
 app.get('/v1/workspaces/:id/events', { preHandler: authenticate }, async (req) => {
   const workspaceId = (req.params as { id: string }).id;
